@@ -1,0 +1,241 @@
+---
+title: "PM_FactorModel EM Prediction"
+output:
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(lubridate)
+library(sp)
+library(crs)
+library(fda)
+library(gstat)
+library(fields)
+library(onlinePCA)
+library(quantreg)
+
+tibble_to_X<- function(data){
+  df = data %>% pivot_wider(names_from = code, values_from = PM25)
+  X = matrix(unlist(df[1:nrow(df),3:(ncol(df))]),nrow=nrow(df))###make matrix
+  colnames(X) =colnames(df)[3:ncol(df)]
+  return(X)
+}
+X_to_tibble <- function(X){
+  df = as_tibble(X)
+  df = df %>% mutate(date = wdata$date, date_idx = wdata$date_idx) %>% dplyr::select(date,date_idx,everything())
+  df = df %>% pivot_longer(3:ncol(df),"code")
+  return(df)
+}
+impute.kr <- function(X){
+  for(i in 1:nrow(X)){
+    tmp = cbind(t(X)[,i], loc[colnames(X),])
+    colnames(tmp) = c("PM","x","y")
+    data = as.data.frame( tmp[!is.na(tmp[,"PM"]),])
+    coordinates(data) <- ~ x + y 
+    lzn.vgm <- variogram(PM~1, data)
+    lzn.fit <- fit.variogram(lzn.vgm, model=vgm(1, "Sph"))
+    while(lzn.fit$range<0){ 
+      nn = 2
+      lzn.fit <- fit.variogram(lzn.vgm, model=vgm(nn, "Exp"));nn = nn+1 }
+    if(sum(is.na(tmp[,"PM"]))==0){
+      next
+    }else if(sum(is.na(tmp[,"PM"]))==1){
+      data.fill = as.data.frame( t(tmp[is.na(tmp[,"PM"]),]))
+      coordinates(data.fill) <- ~ x + y # step 3 above
+      lzn.kriged <- krige(PM~1, data, data.fill, model=lzn.fit)
+      tmp[names(which(is.na(tmp[,"PM"]))),"PM"] = lzn.kriged$var1.pred
+    }else{
+      data.fill = as.data.frame( tmp[is.na(tmp[,"PM"]),])
+      coordinates(data.fill) <- ~ x + y # step 3 above
+      lzn.kriged <- krige(PM~1, data, data.fill, model=lzn.fit)
+      tmp[rownames(data.fill@coords),"PM"] = lzn.kriged$var1.pred
+    }
+    
+    X[i,] = tmp[,"PM"]
+  }
+  return(X)
+}
+factorize<- function(Y,r){
+  N = ncol(Y) 
+  Te = nrow(Y)
+  temp <- svd(Y/sqrt(Te))
+  L.hat = sqrt(N)*(temp$v)[,1:r]
+  F.hat = Y %*% L.hat / N 
+  return(list(F=F.hat,L=L.hat))
+}
+penalty<-function(c,N){ return((N+c)/{N*c}*log(c*N/(c+N))) }
+
+```
+
+First, Read Data
+
+```{r}
+xdata <- readRDS("data/dataset_6hr.rds")
+xdata = xdata %>% arrange(date) %>% mutate(PM25 = replace(PM25,is.nan(PM25),NA))
+summary(xdata)
+#Make location table with longitude and latitude information
+observatory_airkorea <- read.csv("./data/observatory_airkorea.csv")
+loc = as.matrix(observatory_airkorea[,c("log","lat")])
+rownames(loc) = observatory_airkorea$station
+colnames(loc) = c("lon","lat")
+```
+
+
+## Missing Imputation
+
+##### Data Preprocessing
+First, remove stations with NAs more than 20 percent. As a result, we have 483 stations.
+
+```{r}
+wdata = xdata %>% pivot_wider(names_from = code, values_from = PM25)
+nacount = sapply(wdata, function(x){sum(is.na(x))})
+napercent = round(nacount*100/length(unique(xdata$date))/4,1)
+na.data = tibble(code = names(nacount), nacount, napercent)
+tdata = xdata %>% filter(! code %in% (na.data %>% filter( napercent>20))$code)
+tdata = tdata %>% filter(code %in% rownames(loc))
+wdata = tdata %>% pivot_wider(names_from = code, values_from = PM25)
+#non-missing subset to get the initial estimate.
+#full_subset = (na.data %>% filter(!code %in% c("date","date_idx"))  %>% filter(nacount<25))$code
+num_na <- function(x){sum(is.na(x))}
+na.count = apply(wdata,1,num_na)
+full_subset =  wdata$date[which(na.count<=5)]
+```
+
+## 1. random missings
+
+##### Make Train-Test sets 
+
+```{r}
+set.seed(2022)
+idx = sample(nrow(tdata), as.integer(nrow(tdata)*0.05))
+idx = idx[!(tdata[idx,]$date %in% full_subset)]
+test = tdata[idx,]
+train = tdata
+train[idx,]$PM25 = NA
+```
+
+##### Centering the data
+
+```{r fig =T}
+monthmean <- train %>% mutate(eachdate = format(date,"%m-%d")) %>% group_by(code,eachdate) %>% summarise(mean = mean(PM25,na.rm=T))
+train = train %>% mutate(eachdate = format(date,"%m-%d")) %>% left_join(monthmean, by = c("code"="code", "eachdate"="eachdate")) %>% mutate(PM25 = PM25-mean) %>% dplyr::select(-eachdate)
+test = test  %>% mutate(eachdate = format(date,"%m-%d")) %>% left_join(monthmean, by = c("code"="code","eachdate"="eachdate")) %>% dplyr::select(-eachdate)
+monthmean_total <- tdata %>% mutate(eachdate = format(date,"%m-%d")) %>% group_by(code,eachdate) %>% summarise(mean = mean(PM25,na.rm=T))
+run_data = tdata %>% mutate(eachdate = format(date,"%m-%d")) %>% left_join(monthmean_total, by = c("code"="code", "eachdate"="eachdate")) %>% mutate(PM25 = PM25-mean) %>% dplyr::select(-eachdate)
+
+W =  tibble_to_X(run_data%>% dplyr::select(-mean))
+X = tibble_to_X(train %>% dplyr::select(-mean))
+index.na = which(is.na(X))
+na.orig = which(is.na(W))
+
+plot_missing = matrix(0,nrow=nrow(X), ncol=ncol(X))
+plot_missing[index.na[!index.na %in% na.orig]] =1
+plot_missing[which(apply(plot_missing,1,sum)==0),1]=0.01
+heatmap(plot_missing, Rowv = NA, Colv = NA)
+```
+
+### Step 1: Prediction (Imputation) by Kriging
+
+```{r warning=FALSE, result='hide'}
+X.out1 = impute.kr(X)
+saveRDS(X.out1,file="Xout1_kriging20.rds")
+#X.out1 <- readRDS("results/Xout1_kriging20.rds")
+rst1 = X_to_tibble(X.out1)
+fin = test %>% left_join(rst1, by= c("date"="date", "date_idx"="date_idx", "code"="code"))%>% mutate(pred = value, true = PM25) %>% dplyr::select(-c(value,PM25))
+pred.r = data.frame( krig_random = c(mean((fin$true-fin$mean -fin$pred)^2,na.rm=TRUE),mean(abs(fin$true-fin$mean -fin$pred),na.rm=TRUE)))
+rownames(pred.r)= c("MSE", "MAE")
+```
+
+### Step 2: EM analysis
+
+* performance of Missing imputation with Train-validation set. 
+
+```{r fig = TRUE, warning=FALSE}
+Y = as.matrix(X.out1[which(na.count<=5),])
+true = W[index.na]
+run_em <- function(X,maxitr=80, r =3, is.fac = TRUE, index.na,save=""){
+  #Initialization
+  sq.vec = c()
+  temp <- factorize(Y,r)
+  L.hat = temp$L
+  itr=1
+  N = ncol(X) 
+  Te = nrow(X)
+  F.hat = matrix(NA,nrow=Te,ncol=r)
+  for(i in 1:Te){
+    na.idx = is.na(X[i,])
+    F.hat[i,] = solve(t(L.hat[!na.idx,])%*%L.hat[!na.idx,])%*%t(L.hat[!na.idx,])%*%X[i,!na.idx]
+  }
+  while(itr<=maxitr){
+    X.hat = F.hat %*% t(L.hat)
+    
+    sq.vec[itr]= mean((X.hat[index.na] - true)^2, na.rm=T)
+    
+    if(itr>1 &&( (prod(X[index.na]== X.hat[index.na]))|| (mean(abs(X[index.na] - X.hat[index.na]))< 0.003)) ){ #
+      X[index.na]= X.hat[index.na]
+      print("done")
+      break}
+    X[index.na]= X.hat[index.na]
+    itr = itr+1
+    temp <- svd(X/sqrt(Te))
+    if(itr ==2){
+      facs = sapply(1:10, function(c){which.min(sapply(1:N, function(r){sum((temp$d)[r:N]^2)/N + c*r*penalty(c,N)}))})
+      print("number of factors:")
+      print(facs)
+      print("Variance explained")
+      print(round((temp$d[1:10])^2/sum((temp$d)^2)*100,2))
+      print(sapply(1:10, function(r){round(sum(temp$d[1:r]^2)/sum((temp$d)^2)*100,2)}))
+    }
+    L.hat = sqrt(N)*(temp$v)[,1:r] # N x r
+    F.hat = X %*% L.hat / N # T x r
+  }
+  if(save!=""){saveRDS(X, file = sprintf("%s.rds",save)) }
+  if(is.fac){
+    print(sq.vec)
+    print(paste("Number of updates : ",itr,sep=""))
+    return(list(F = F.hat, L = L.hat,X=X, r=r, sq.vec = sq.vec))
+  }
+  return(list(X=X, sq.vec = sq.vec))
+}
+list.em = list()
+if(TRUE){
+  for(r in 22:50){
+    print(r)
+    list.em[[r-1]]= run_em(X, maxitr=1000, r=r,index.na = index.na)
+  }
+  saveRDS(list.em,file="listem_50.rds")
+}
+
+list.em_sqvec=list()
+for(r in (2:50)){
+  list.em_sqvec[[r-1]]= list.em[[r-1]]$sq.vec
+}
+saveRDS(list.em_sqvec,file="em_results.rds")
+```
+
+```{r}
+mse = c()
+for(l in 1:49){
+    mse = c(mse, (list.em_sqvec[[l]])[length((list.em_sqvec[[l]]))])
+}
+sapply(list.em_sqvec,function(x){x[length(x)]})
+ggplot(data.frame(r=2:50, MSE = mse)) +geom_line(aes(x=r,y=MSE))+geom_point(aes(x=r,y=MSE)) + geom_hline(aes(yintercept=30.166252, col='kriging')) + labs(x="(a) number of factors")
+p=list()
+p[[1]] = ggplot(fin) + geom_point(aes(x=(true-mean), y=pred)) + geom_point(aes(x=(true-mean), y=EM,col='blue'))+geom_abline(col='red') +
+  scale_colour_manual(name = 'Method',  values =c('blue'='blue','black'='black'), labels = c('AFM','Kriging')) + labs(x='true')
+p[[2]] = ggplot(data.frame(iter=1:50, MSE = list.em_sqvec[[19]][1:50])) +geom_line(aes(x=iter,y=MSE,color = "r=20"))+geom_point(aes(x=iter,y=MSE,color = "r=20"))+ labs(x="number of iteration")
+grid.arrange(grobs=p,ncol=2)
+
+
+rst1 = X_to_tibble(list.em[[19]]$X) 
+fin = fin %>% left_join(rst1, by= c("date"="date", "date_idx"="date_idx", "code"="code"))%>% mutate(EM = value) %>% dplyr::select(-c(value))
+pred.r$EM_random = c(mean((fin$true-fin$mean -fin$EM)^2,na.rm=TRUE),mean(abs(fin$true-fin$mean -fin$EM),na.rm=TRUE))
+pred.r
+
+```
+
